@@ -8,10 +8,11 @@ Covers:
 - DCP Set wire format (odd-length padding, BlockQualifier, Signal)
 - NDR ArgsMaximum sizing
 - Output IOCR frame ID convention (0xFFFF, device assigns)
+- ExpectedSubmoduleBlockReq: one 0x0104 block per slot
 """
 
 import struct
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,10 +24,10 @@ from profinet.alarm_listener import (
 )
 from profinet.alarms import parse_alarm_notification
 from profinet.cyclic import CyclicController, CyclicState
-from profinet.dcp import set_param, signal_device
+from profinet.dcp import DCPDeviceDescription, set_param, signal_device
 from profinet.exceptions import DCPError
-from profinet.protocol import PNRTAHeader
-from profinet.rpc import NDR_ARGS_MAXIMUM, RPCCon
+from profinet.protocol import PNDCPBlock, PNRTAHeader
+from profinet.rpc import NDR_ARGS_MAXIMUM, IOCRSetup, IOSlot, RPCCon
 from profinet.rt import (
     IOCR_TYPE_INPUT,
     IOCR_TYPE_OUTPUT,
@@ -892,3 +893,137 @@ class TestReceivedIops:
         )
         assert ctrl.is_input_good(1, 1)
         assert ctrl.get_input_data(1, 1) == b"\x01\x02\x03\x04"
+
+
+# =============================================================================
+# ExpectedSubmoduleBlockReq: one block per slot
+# =============================================================================
+
+
+def _make_offline_rpccon() -> RPCCon:
+    """RPCCon with patched socket, no network access."""
+    blocks = {
+        PNDCPBlock.NAME_OF_STATION: b"test-device",
+        PNDCPBlock.IP_ADDRESS: bytes([192, 168, 1, 100, 255, 255, 255, 0, 192, 168, 1, 1]),
+        PNDCPBlock.DEVICE_ID: bytes([0x00, 0x2A, 0x00, 0x01]),
+    }
+    info = DCPDeviceDescription(b"\x00\x11\x22\x33\x44\x55", blocks)
+    with patch("profinet.rpc.socket"):
+        rpc = RPCCon(info)
+    return rpc
+
+
+def _iter_blocks(data: bytes):
+    """Yield (block_type, block_bytes) walking the 4+BlockLength chain."""
+    off = 0
+    while off + 4 <= len(data):
+        btype, blen = struct.unpack_from(">HH", data, off)
+        end = off + 4 + blen
+        assert end <= len(data), "block extends past payload"
+        yield btype, data[off:end]
+        off = end
+    assert off == len(data), "payload not exactly consumed by block chain"
+
+
+def _parse_expected_submodule_block(payload: bytes):
+    """Parse one 0x0104 block; return list of (slot, [subslot, ...])."""
+    btype, blen = struct.unpack_from(">HH", payload, 0)
+    assert btype == 0x0104
+    assert payload[4] == 0x01 and payload[5] == 0x00
+    (num_apis,) = struct.unpack_from(">H", payload, 6)
+    pos = 8
+    apis = []
+    for _ in range(num_apis):
+        _api = int.from_bytes(payload[pos : pos + 4], "big")
+        slot_nr = int.from_bytes(payload[pos + 4 : pos + 6], "big")
+        pos += 4 + 2 + 4 + 2  # api, slot, module_ident, module_properties
+        (num_subs,) = struct.unpack_from(">H", payload, pos)
+        pos += 2
+        subslots = []
+        for _ in range(num_subs):
+            subslot = int.from_bytes(payload[pos : pos + 2], "big")
+            props = int.from_bytes(payload[pos + 6 : pos + 8], "big")
+            pos += 8
+            subslots.append(subslot)
+            subm_type = props & 0x03
+            n_dd = 2 if subm_type == 3 else 1
+            pos += n_dd * 6  # DataDescription entries
+        apis.append((slot_nr, subslots))
+    assert pos == len(payload), "0x0104 block content not fully consumed"
+    return apis
+
+
+class TestExpectedSubmoduleOneBlockPerSlot:
+    """One ExpectedSubmoduleBlockReq (0x0104) per slot: a block must
+    never mix slot numbers.
+    """
+
+    def _setup(self):
+        return IOCRSetup(
+            slots=[
+                IOSlot(slot=0, subslot=0x0001, module_ident=1, submodule_ident=1),
+                IOSlot(slot=0, subslot=0x8000, module_ident=1, submodule_ident=0x8000),
+                IOSlot(
+                    slot=1,
+                    subslot=0x0001,
+                    input_length=4,
+                    module_ident=0x1234,
+                    submodule_ident=0x5678,
+                ),
+                IOSlot(
+                    slot=2,
+                    subslot=0x0001,
+                    output_length=2,
+                    module_ident=0x1235,
+                    submodule_ident=0x5679,
+                ),
+                # Same slot as third entry again - must land in that block
+                IOSlot(
+                    slot=1,
+                    subslot=0x0002,
+                    input_length=1,
+                    module_ident=0x1234,
+                    submodule_ident=0x5678,
+                ),
+            ]
+        )
+
+    def test_payload_contains_one_block_per_slot(self):
+        rpc = _make_offline_rpccon()
+        try:
+            data = rpc._build_expected_submodule_block(self._setup())
+        finally:
+            rpc.close()
+
+        blocks = list(_iter_blocks(data))
+        assert len(blocks) == 3, "expected one 0x0104 block per distinct slot"
+        assert all(bt == 0x0104 for bt, _ in blocks)
+
+    def test_slot_number_constant_within_each_block(self):
+        rpc = _make_offline_rpccon()
+        try:
+            data = rpc._build_expected_submodule_block(self._setup())
+        finally:
+            rpc.close()
+
+        per_slot = {}
+        for _, block in _iter_blocks(data):
+            apis = _parse_expected_submodule_block(block)
+            slots_in_block = {slot for slot, _ in apis}
+            assert len(slots_in_block) == 1, "block mixes slot numbers"
+            slot = slots_in_block.pop()
+            per_slot[slot] = sorted(s for _s, subs in apis for s in subs)
+
+        assert per_slot == {0: [0x0001, 0x8000], 1: [0x0001, 0x0002], 2: [0x0001]}
+
+    def test_single_slot_still_produces_single_block(self):
+        rpc = _make_offline_rpccon()
+        setup = IOCRSetup(slots=[IOSlot(slot=0, subslot=1, module_ident=1, submodule_ident=1)])
+        try:
+            data = rpc._build_expected_submodule_block(setup)
+        finally:
+            rpc.close()
+
+        blocks = list(_iter_blocks(data))
+        assert len(blocks) == 1
+        assert _parse_expected_submodule_block(blocks[0][1]) == [(0, [1])]

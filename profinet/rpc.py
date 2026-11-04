@@ -1265,15 +1265,19 @@ class RPCCon:
     ) -> bytes:
         """Build ExpectedSubmoduleBlockReq (0x0104) for AR establishment.
 
-        Tells the device what modules/submodules we expect.
+        Tells the device what modules/submodules we expect. One block
+        per distinct slot number, concatenated in order of first
+        appearance in ``setup.slots``.
 
         Args:
             setup: IOCRSetup with slot configuration
 
         Returns:
-            Serialized ExpectedSubmoduleBlockReq bytes
+            Concatenated serialized ExpectedSubmoduleBlockReq bytes
+            (one block per slot)
         """
-        builder = ExpectedSubmoduleBlockReq()
+        # One builder per slot; dict preserves insertion order.
+        builders: Dict[int, ExpectedSubmoduleBlockReq] = {}
 
         for slot_cfg in setup.slots:
             # Derive submodule_type from input/output lengths:
@@ -1289,6 +1293,11 @@ class RPCCon:
             else:
                 submodule_type = 0  # NO_IO
 
+            builder = builders.get(slot_cfg.slot)
+            if builder is None:
+                builder = ExpectedSubmoduleBlockReq()
+                builders[slot_cfg.slot] = builder
+
             builder.add_submodule(
                 api=slot_cfg.api,
                 slot=slot_cfg.slot,
@@ -1300,7 +1309,7 @@ class RPCCon:
                 output_length=slot_cfg.output_length,
             )
 
-        return builder.to_bytes()
+        return b"".join(b.to_bytes() for b in builders.values())
 
     def _parse_iocr_response(
         self,

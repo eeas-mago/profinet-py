@@ -3,11 +3,18 @@
 
 from profinet import ExpectedSubmoduleBlockReq
 
-# Build expected configuration
-builder = ExpectedSubmoduleBlockReq()
+# One builder per slot (slot 0 = DAP/interface/ports, slot 1 = I/O module)
+builders = {}
+
+
+def builder_for(slot: int) -> ExpectedSubmoduleBlockReq:
+    if slot not in builders:
+        builders[slot] = ExpectedSubmoduleBlockReq()
+    return builders[slot]
+
 
 # Add DAP (Device Access Point)
-builder.add_submodule(
+builder_for(0).add_submodule(
     api=0,
     slot=0,
     subslot=0x0001,  # DAP
@@ -17,7 +24,7 @@ builder.add_submodule(
 )
 
 # Add interface submodule
-builder.add_submodule(
+builder_for(0).add_submodule(
     api=0,
     slot=0,
     subslot=0x8000,  # Interface
@@ -28,7 +35,7 @@ builder.add_submodule(
 
 # Add port submodules
 for port_num in range(1, 3):
-    builder.add_submodule(
+    builder_for(0).add_submodule(
         api=0,
         slot=0,
         subslot=0x8000 + port_num,  # Port 1, 2
@@ -38,7 +45,7 @@ for port_num in range(1, 3):
     )
 
 # Add I/O module with input data
-builder.add_submodule(
+builder_for(1).add_submodule(
     api=0,
     slot=1,
     subslot=0x0001,
@@ -48,11 +55,12 @@ builder.add_submodule(
     input_length=16,
 )
 
-# Build the block
-block_data = builder.to_bytes()
-print(f"ExpectedSubmoduleBlockReq: {len(block_data)} bytes")
-print(f"APIs: {len(builder.apis)}")
-for api in builder.apis:
-    print(f"  API {api.api}, Slot {api.slot_number}:")
-    for sub in api.submodules:
-        print(f"    Subslot 0x{sub.subslot_number:04X}, Type {sub.submodule_type}")
+# Build the blocks (one per slot), concatenated as in a Connect request
+block_data = b"".join(b.to_bytes() for b in builders.values())
+print(f"ExpectedSubmoduleBlockReq blocks: {len(builders)} slots, {len(block_data)} bytes total")
+for slot, builder in builders.items():
+    print(f"  Slot {slot}:")
+    for api in builder.apis:
+        print(f"    API {api.api}:")
+        for sub in api.submodules:
+            print(f"      Subslot 0x{sub.subslot_number:04X}, Type {sub.submodule_type}")
