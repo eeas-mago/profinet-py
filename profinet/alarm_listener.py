@@ -190,25 +190,36 @@ class AlarmListener:
     def stop(self) -> None:
         """Stop alarm listener.
 
-        Signals thread to stop and waits for graceful shutdown.
+        Signals the thread to stop and waits for graceful shutdown.
+
+        The socket must not be closed while the listener thread may still
+        be inside ``recv``: on Windows/npcap a concurrent close of the
+        address-family packet handle crashes the process (access
+        violation) in the next ``recv``. The socket is created with a
+        short receive timeout, so the loop observes ``_running`` quickly;
+        close the socket only after the thread has finished.
         """
         if not self._running:
             return
 
         self._running = False
 
-        # Close socket to unblock recv
+        # Wait for the thread to leave recv before closing the socket.
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                logger.warning(
+                    "Alarm listener thread did not stop cleanly; "
+                    "keeping the socket open to avoid a use-after-free"
+                )
+                self._thread = None
+                return
+
         if self._sock:
             try:
                 self._sock.close()
             except OSError:
                 pass
-
-        # Wait for thread to finish
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-            if self._thread.is_alive():
-                logger.warning("Alarm listener thread did not stop cleanly")
 
         self._sock = None
         self._thread = None
